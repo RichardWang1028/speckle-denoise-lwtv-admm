@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+Thumbs.db
+.vscode/
+
+runs/
+logs/
+
+DIV2K_train_HR_gray/
+IM_0003/
+checkpoints/
+*.pt
+*.pth
+
+*.csv
+*.npz
