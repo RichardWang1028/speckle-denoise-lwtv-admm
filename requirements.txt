@@ -1,0 +1,6 @@
+numpy>=1.23
+matplotlib>=3.7
+Pillow>=9.5
+torch>=2.0
+scikit-image>=0.20
+pydicom>=2.4
