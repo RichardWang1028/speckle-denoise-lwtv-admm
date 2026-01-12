@@ -221,6 +221,79 @@ def infer_alpha_volume_by_slices(
     return out
 
 
+# ============================================================
+# Slice selection helpers (for qualitative comparisons)
+# ============================================================
+def parse_slices_list(s: Optional[str], Z: int) -> Optional[list[int]]:
+    """
+    Parse a user-specified slice list.
+
+    Examples:
+      --slices "0,50,100,250,300,500"
+      --slices "0:500:50"   (inclusive)
+      --slices "-1"         (last slice)
+
+    Returns sorted unique indices, or None if s is None/empty.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "":
+        return None
+
+    idxs: list[int] = []
+    tokens = [tok.strip() for tok in s.split(",") if tok.strip()]
+
+    for tok in tokens:
+        if ":" in tok:
+            parts = [p.strip() for p in tok.split(":")]
+            if len(parts) == 2:
+                a, b = int(parts[0]), int(parts[1])
+                step = 1
+            elif len(parts) == 3:
+                a, b, step = int(parts[0]), int(parts[1]), int(parts[2])
+            else:
+                raise ValueError("Bad --slices token. Use 'a:b' or 'a:b:step' or comma-separated indices.")
+            if step == 0:
+                raise ValueError("Bad --slices token: step cannot be 0.")
+            if (b - a) * step < 0:
+                raise ValueError("Bad --slices token: step sign is inconsistent with range direction.")
+            idxs.extend(list(range(a, b + (1 if step > 0 else -1), step)))
+        else:
+            idxs.append(int(tok))
+
+    out: list[int] = []
+    for z in idxs:
+        if z < 0:
+            z = Z + z
+        if 0 <= z < Z:
+            out.append(int(z))
+
+    out = sorted(set(out))
+    if len(out) == 0:
+        raise ValueError(f"--slices parsed to an empty set (Z={Z}). Check your indices.")
+    return out
+
+
+def pick_evenly_spaced_slices(Z: int, k: int, margin: int = 0) -> list[int]:
+    Z = int(Z)
+    k = int(k)
+    margin = int(margin)
+    if Z <= 0:
+        raise ValueError("Empty DICOM: no slices found.")
+    if k <= 0:
+        raise ValueError("sample_k must be > 0.")
+
+    a = max(0, margin)
+    b = max(0, Z - 1 - margin)
+    if b < a:
+        a, b = 0, Z - 1
+
+    idx = np.linspace(a, b, num=min(k, b - a + 1), dtype=int)
+    idx = np.unique(idx)
+    return idx.tolist()
+
+
 @dataclass
 class Full3DConfig:
     dicom: str
@@ -243,6 +316,11 @@ class Full3DConfig:
     admm_tol: float
     auto_beta: bool
     z_limit: int
+
+    # slice selection for saved PNG comparisons (does not change the 3D solve)
+    slices: Optional[str]
+    sample_k: int
+    sample_margin: int
 
 
 def main():
@@ -268,6 +346,14 @@ def main():
     ap.add_argument("--auto_beta", action="store_true")
 
     ap.add_argument("--z_limit", type=int, default=-1, help="-1 for full volume, else use first z_limit slices")
+
+    # Slice selection for qualitative comparisons
+    ap.add_argument("--slices", default=None,
+                    help="Explicit slice indices for saved PNG comparisons, e.g. \'0,50,100\' or \'0:500:50\'.")
+    ap.add_argument("--sample_k", type=int, default=6,
+                    help="If --slices is not given: save k evenly spaced slices for comparisons.")
+    ap.add_argument("--sample_margin", type=int, default=0,
+                    help="Exclude this many boundary slices at each end when auto-sampling.")
     args = ap.parse_args()
 
     cfg = Full3DConfig(
@@ -289,6 +375,9 @@ def main():
         admm_tol=float(args.admm_tol),
         auto_beta=bool(args.auto_beta),
         z_limit=int(args.z_limit),
+        slices=None if args.slices is None else str(args.slices),
+        sample_k=int(args.sample_k),
+        sample_margin=int(args.sample_margin),
     )
 
     dicom_path = Path(cfg.dicom)
@@ -306,9 +395,34 @@ def main():
         print("Loaded:", dicom_path.name, "shape:", b01.shape, "dtype:", ds.pixel_array.dtype)
         print("Scale:", scale)
 
+        # Decide which slices to export as qualitative comparisons
+        Z = int(b01.shape[0])
+        slice_ids = parse_slices_list(cfg.slices, Z)
+        if slice_ids is None:
+            k = int(cfg.sample_k) if int(cfg.sample_k) > 0 else 6
+            slice_ids = pick_evenly_spaced_slices(Z, k=k, margin=int(cfg.sample_margin))
+        # Note: if z_limit is applied below, slice_ids will still be valid because Z is recomputed after truncation.
+        
         if cfg.z_limit > 0:
             b01 = b01[: cfg.z_limit]
             print("Using first z_limit slices:", b01.shape)
+            Z = int(b01.shape[0])
+            # Clamp previously chosen slice_ids to the truncated volume
+            slice_ids = [z for z in slice_ids if 0 <= z < Z]
+            if len(slice_ids) == 0:
+                slice_ids = pick_evenly_spaced_slices(Z, k=max(1, min(int(cfg.sample_k), Z)), margin=int(cfg.sample_margin))
+            np.save(run_dir / "slice_indices.npy", np.array(slice_ids, dtype=np.int32))
+            (run_dir / "slice_indices.json").write_text(json.dumps(slice_ids, indent=2), encoding="utf-8")
+
+        # Decide which slices to export as qualitative comparisons
+        Z = int(b01.shape[0])
+        slice_ids = parse_slices_list(cfg.slices, Z)
+        if slice_ids is None:
+            k = int(cfg.sample_k) if int(cfg.sample_k) > 0 else 6
+            slice_ids = pick_evenly_spaced_slices(Z, k=k, margin=int(cfg.sample_margin))
+        print(f"Selected {len(slice_ids)} slice(s) for comparisons: {slice_ids}")
+        np.save(run_dir / "slice_indices.npy", np.array(slice_ids, dtype=np.int32))
+        (run_dir / "slice_indices.json").write_text(json.dumps(slice_ids, indent=2), encoding="utf-8")
 
         # alpha selection
         alpha_for_solver: Any = float(cfg.alpha_const)
@@ -402,12 +516,12 @@ def main():
         print("Saved denoised DICOM:", saved.resolve())
 
         cmp_dir = run_dir / "compare_slices"
-        save_slice_comparisons(b01, u01, cmp_dir)
+        save_slice_comparisons(b01, u01, cmp_dir, slice_ids=slice_ids)
         print("Saved slice comparisons to:", cmp_dir.resolve())
 
         prev_dir = run_dir / "preview_png"
         prev_dir.mkdir(exist_ok=True)
-        for z in [0, min(10, u01.shape[0] - 1), u01.shape[0] // 2]:
+        for z in slice_ids:
             Image.fromarray((b01[z] * 255).astype(np.uint8)).save(prev_dir / f"b_{z:04d}.png")
             Image.fromarray((u01[z] * 255).astype(np.uint8)).save(prev_dir / f"u_{z:04d}.png")
         print("Saved quick preview PNGs to:", prev_dir.resolve())

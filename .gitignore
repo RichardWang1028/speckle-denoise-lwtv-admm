@@ -1,18 +1,14 @@
+# Python cache
 __pycache__/
 *.pyc
-Thumbs.db
-.vscode/
 
+# Local data / outputs
 runs/
-logs/
-
+checkpoints/
 DIV2K_train_HR_gray/
 IM_0003/
-checkpoints/
+previous_version/
+
+# model weights
 *.pt
 *.pth
-
-*.csv
-*.npz
-
-IM_0003
