@@ -12,3 +12,4 @@ previous_version/
 # model weights
 *.pt
 *.pth
+IM_0003/
