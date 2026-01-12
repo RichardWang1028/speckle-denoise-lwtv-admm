@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 from contextlib import contextmanager
@@ -16,7 +15,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-
 import torch
 
 # Project modules (must exist in the same project)
@@ -28,6 +26,7 @@ from alpha_net import (
     make_alpha_target_from_clean,
     gradmag_np,
 )
+
 from solver_admm_2d import Backend, admm_speckle_scaled
 
 
@@ -109,9 +108,7 @@ def ssim_metric(u_true: np.ndarray, u_hat: np.ndarray) -> float:
     try:
         from skimage.metrics import structural_similarity as ssim
     except Exception as e:
-        raise RuntimeError(
-            "SSIM requires scikit-image. Install with: pip install scikit-image"
-        ) from e
+        raise RuntimeError("SSIM requires scikit-image. Install with: pip install scikit-image") from e
 
     u_true = np.asarray(u_true, dtype=np.float32)
     u_hat = np.asarray(u_hat, dtype=np.float32)
@@ -228,6 +225,11 @@ class RunConfig:
     out_root: str
     tag: str
 
+    # ADMM penalty mode (DEFAULT: fixed beta; enable adaptive by --auto_beta)
+    auto_beta: bool
+    beta_mult: float
+    balance_mu: float
+
     synthetic: bool
     var: float
     seed: int
@@ -259,13 +261,14 @@ def make_run_dir(out_root: Path, tag: str, img_path: Path, cfg: RunConfig) -> Pa
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = img_path.stem
     syn = f"syn_var{cfg.var:g}_seed{cfg.seed}" if cfg.synthetic else "real"
+    pen = "autobeta" if cfg.auto_beta else "fixedbeta"
 
     if cfg.mu_list is not None or cfg.beta_list is not None:
         mN = len(cfg.mu_list or [cfg.mu])
         bN = len(cfg.beta_list or [cfg.beta0])
-        hp = f"SWEEP_mu{mN}_beta{bN}"
+        hp = f"SWEEP_mu{mN}_beta{bN}_{pen}"
     else:
-        hp = f"mu{cfg.mu:g}_beta{cfg.beta0:g}"
+        hp = f"mu{cfg.mu:g}_beta{cfg.beta0:g}_{pen}"
 
     name = f"{tag}_{hp}_{stem}_{syn}_{ts}"
     run_dir = out_root / name
@@ -288,6 +291,9 @@ def run_one_method(
     beta0: float,
     n_admm_iters: int,
     n_pd_iters: int,
+    auto_beta: bool,
+    beta_mult: float,
+    balance_mu: float,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -309,6 +315,9 @@ def run_one_method(
         beta=float(beta0),
         n_admm_iters=int(n_admm_iters),
         n_pd_iters=int(n_pd_iters),
+        auto_beta=bool(auto_beta),
+        beta_mult=float(beta_mult),
+        balance_mu=float(balance_mu),
         verbose=False,
     )
     t_sec = time.time() - t0
@@ -319,7 +328,8 @@ def run_one_method(
 
     save_gray01_png(b_vis, out_dir / "noisy.png")
     save_gray01_png(u_hat, out_dir / "denoised.png")
-    save_gray01_png((a_vis - a_vis.min()) / (a_vis.max() - a_vis.min() + 1e-12), out_dir / "alpha_vis.png")
+    a_norm = (a_vis - a_vis.min()) / (a_vis.max() - a_vis.min() + 1e-12)
+    save_gray01_png(a_norm, out_dir / "alpha_vis.png")
 
     # ADMM history
     hist = np.asarray(hist)
@@ -336,15 +346,21 @@ def run_one_method(
         r_norm, s_norm, eps_pri, eps_dual = float(last[1]), float(last[2]), float(last[3]), float(last[4])
         converged = (r_norm <= eps_pri) and (s_norm <= eps_dual)
         admm_iters_used = int(hist.shape[0])
+        beta_final = float(last[0])
     else:
         converged = False
         admm_iters_used = int(n_admm_iters)
+        beta_final = float(beta0)
 
     # Compare figure + metrics
     metrics: Dict[str, Any] = {
         "method": method_label,
         "mu": float(mu),
         "beta0": float(beta0),
+        "auto_beta": bool(auto_beta),
+        "beta_mult": float(beta_mult),
+        "balance_mu": float(balance_mu),
+        "beta_final": float(beta_final),
         "runtime_sec": float(t_sec),
         "admm_iters_target": int(n_admm_iters),
         "admm_iters_used": int(admm_iters_used),
@@ -367,9 +383,56 @@ def run_one_method(
     return metrics
 
 
+def _load_alpha_ckpt_into_net(net: torch.nn.Module, ckpt_path: Path, device: torch.device) -> Dict[str, Any]:
+    """
+    Robust checkpoint loader.
+
+    Supports:
+      - {"state_dict": <weights>, "alpha_min":..., "alpha_max":..., "k":...}
+      - {"model_state_dict": <weights>, ...}
+      - {"model": <weights>, ...}
+      - <weights> (plain state_dict)
+    """
+    raw = torch.load(str(ckpt_path), map_location=device)
+
+    if not isinstance(raw, dict):
+        raise RuntimeError("Unexpected checkpoint format: expected a dict checkpoint.")
+
+    if "state_dict" in raw:
+        sd = raw["state_dict"]
+    elif "model_state_dict" in raw:
+        sd = raw["model_state_dict"]
+    elif "model" in raw:
+        sd = raw["model"]
+    else:
+        # maybe it IS the state_dict
+        sd = raw
+
+    if not isinstance(sd, dict):
+        raise RuntimeError("Unexpected checkpoint state_dict format (not a dict).")
+
+    # Strip DataParallel prefix if present
+    sd = {k.replace("module.", ""): v for k, v in sd.items()}
+
+    try:
+        net.load_state_dict(sd, strict=True)
+    except RuntimeError as e:
+        # Make the error more actionable.
+        # (Do not silently set strict=False here; that can hide real mismatches.)
+        raise RuntimeError(
+            "Failed to load checkpoint weights into AlphaUNetSmall. "
+            "This usually means the checkpoint was trained with a different architecture, "
+            "or the wrong key was loaded (expected a state_dict). "
+            f"Checkpoint: {ckpt_path}"
+        ) from e
+
+    return raw
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Step 2: ADMM speckle denoising with learned alpha-map (SSIM + ISNR only)."
+        description="Step 2: ADMM speckle denoising with learned alpha-map (SSIM + ISNR only). "
+                    "Default is FIXED beta (thesis-consistent). Enable adaptive beta by --auto_beta."
     )
     ap.add_argument("--img", required=True, help="path to input image")
     ap.add_argument("--ckpt", required=True, help="path to alpha_net checkpoint (.pt)")
@@ -383,7 +446,7 @@ def main() -> None:
 
     # single-run hyperparams
     ap.add_argument("--mu", type=float, default=2.0, help="data-fidelity weight mu")
-    ap.add_argument("--beta0", type=float, default=700.0, help="ADMM penalty beta0")
+    ap.add_argument("--beta0", type=float, default=700.0, help="ADMM penalty beta0 (initial/fixed)")
 
     # sweep hyperparams (optional)
     ap.add_argument("--mu_list", default=None, help="comma-separated sweep values, overrides --mu")
@@ -392,6 +455,11 @@ def main() -> None:
     ap.add_argument("--admm", type=int, default=200, help="ADMM iterations")
     ap.add_argument("--pd", type=int, default=80, help="primal-dual iterations per ADMM step")
     ap.add_argument("--prefer_gpu", action="store_true", help="use GPU backend via CuPy for ADMM (if available)")
+
+    # IMPORTANT: default fixed beta; enable adaptive by flag
+    ap.add_argument("--auto_beta", action="store_true", help="enable adaptive beta update (scaled ADMM heuristic)")
+    ap.add_argument("--beta_mult", type=float, default=2.0, help="adaptive beta multiplier (when balancing residuals)")
+    ap.add_argument("--balance_mu", type=float, default=10.0, help="residual-balance threshold (mu in literature)")
 
     ap.add_argument("--alpha_min", type=float, default=0.2, help="alpha lower bound")
     ap.add_argument("--alpha_max", type=float, default=2.0, help="alpha upper bound")
@@ -408,20 +476,30 @@ def main() -> None:
         ckpt=str(args.ckpt),
         out_root=str(args.out_root),
         tag=str(args.tag),
+
+        auto_beta=bool(args.auto_beta),          # DEFAULT False (fixed beta)
+        beta_mult=float(args.beta_mult),
+        balance_mu=float(args.balance_mu),
+
         synthetic=bool(args.synthetic),
         var=float(args.var),
         seed=int(args.seed),
         cache_noise=bool(args.cache_noise),
+
         mu=float(args.mu),
         beta0=float(args.beta0),
+
         mu_list=_csv_floats(args.mu_list),
         beta_list=_csv_floats(args.beta_list),
+
         admm=int(args.admm),
         pd=int(args.pd),
         prefer_gpu=bool(args.prefer_gpu),
+
         alpha_min=float(args.alpha_min),
         alpha_max=float(args.alpha_max),
         k=float(args.k),
+
         alpha_const=None if args.alpha_const is None else float(args.alpha_const),
         run_const=not bool(args.no_const),
         run_oracle=not bool(args.no_oracle),
@@ -441,6 +519,13 @@ def main() -> None:
         print(json.dumps(asdict(cfg), indent=2))
         with open(run_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(asdict(cfg), f, indent=2)
+
+        if cfg.auto_beta:
+            print("=== ADMM penalty mode ===")
+            print("Adaptive beta ENABLED (--auto_beta). This is a heuristic and not covered by fixed-penalty convergence theory.")
+        else:
+            print("=== ADMM penalty mode ===")
+            print("Fixed beta (DEFAULT). This matches the convergence analysis assumptions in the thesis.")
 
         # Load input
         u_in = load_gray01(str(img_path))
@@ -486,13 +571,7 @@ def main() -> None:
         net = AlphaUNetSmall().to(device)
         net.eval()
 
-        ckpt = torch.load(ckpt_path, map_location=device)
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            net.load_state_dict(ckpt["model_state_dict"], strict=True)
-        elif isinstance(ckpt, dict):
-            net.load_state_dict(ckpt, strict=False)
-        else:
-            raise RuntimeError("Unexpected checkpoint format.")
+        ckpt_meta = _load_alpha_ckpt_into_net(net, ckpt_path, device)
 
         # Infer learned alpha-map
         alpha_min, alpha_max, k = cfg.alpha_min, cfg.alpha_max, cfg.k
@@ -508,29 +587,28 @@ def main() -> None:
             print(f"{kk:>12s}: {vv}")
         try:
             c = corr_alpha_grad(alpha_np, b)
-            print(f"{'corr(alpha,|∇b|)':>12s}: {c:+.4f}")
+            print(f"{'corr(alpha,|∇b|)':>18s}: {c:+.4f}")
         except Exception as e:
             print("corr(alpha,|∇b|) failed:", repr(e))
 
         # Oracle alpha (only meaningful for synthetic, uses clean u_true)
         oracle_alpha_np: Optional[np.ndarray] = None
         if cfg.synthetic and cfg.run_oracle and (u_true is not None):
-            oracle_alpha_np = make_alpha_target_from_clean(u_true, alpha_min=alpha_min, alpha_max=alpha_max, k=k).astype(np.float32)
+            oracle_alpha_np = make_alpha_target_from_clean(
+                u_true, alpha_min=alpha_min, alpha_max=alpha_max, k=k
+            ).astype(np.float32)
             print("=== Oracle alpha diagnostics (from clean u_true) ===")
             st2 = alpha_stats(oracle_alpha_np)
             for kk, vv in st2.items():
                 print(f"{kk:>12s}: {vv}")
-            try:
-                c2 = corr_alpha_grad(oracle_alpha_np, u_true)
-                print(f"{'corr(alpha,|∇u|)':>12s}: {c2:+.4f}")
-            except Exception as e:
-                print("corr(alpha,|∇u|) failed:", repr(e))
 
         # Constant alpha baseline
         alpha_const = cfg.alpha_const
         if alpha_const is None:
             alpha_const = float(alpha_np.mean())
             print(f"alpha_const not provided -> using mean(learned alpha) = {alpha_const:.6f}")
+        else:
+            print(f"alpha_const provided = {alpha_const:.6f}")
 
         # Backend + move noisy image once
         backend = Backend(prefer_gpu=cfg.prefer_gpu, dtype=np.float32)
@@ -540,7 +618,6 @@ def main() -> None:
         # Build grids
         mu_grid = cfg.mu_list if cfg.mu_list is not None else [cfg.mu]
         beta_grid = cfg.beta_list if cfg.beta_list is not None else [cfg.beta0]
-
         do_sweep = (cfg.mu_list is not None) or (cfg.beta_list is not None)
 
         summary_rows: List[Dict[str, Any]] = []
@@ -565,6 +642,9 @@ def main() -> None:
                     beta0=float(beta0),
                     n_admm_iters=cfg.admm,
                     n_pd_iters=cfg.pd,
+                    auto_beta=cfg.auto_beta,
+                    beta_mult=cfg.beta_mult,
+                    balance_mu=cfg.balance_mu,
                 )
                 summary_rows.append(m)
 
@@ -599,6 +679,9 @@ def main() -> None:
                 beta0=float(beta00),
                 n_admm_iters=cfg.admm,
                 n_pd_iters=cfg.pd,
+                auto_beta=cfg.auto_beta,
+                beta_mult=cfg.beta_mult,
+                balance_mu=cfg.balance_mu,
             )
             summary_rows.append(m)
 
@@ -616,6 +699,9 @@ def main() -> None:
                 beta0=float(beta00),
                 n_admm_iters=cfg.admm,
                 n_pd_iters=cfg.pd,
+                auto_beta=cfg.auto_beta,
+                beta_mult=cfg.beta_mult,
+                balance_mu=cfg.balance_mu,
             )
             summary_rows.append(m)
 
@@ -632,6 +718,7 @@ def main() -> None:
         for row in summary_rows:
             meth = row.get("method", "")
             parts = [f"mu={row.get('mu')}", f"beta0={row.get('beta0')}"]
+            parts.append(f"auto_beta={row.get('auto_beta')}")
             if "ssim" in row:
                 parts.append(f"ssim={row['ssim']:.4f}")
             if "isnr" in row:
@@ -642,12 +729,8 @@ def main() -> None:
 
         # Compare-all image: use best learned (if sweep+GT), else learned_alpha single run
         denoised_items: List[Tuple[str, np.ndarray]] = []
-
-        # load denoised images from disk for robustness
         if u_true is not None:
-            # choose learned result to display
             if do_sweep and best_learned is not None:
-                # best_learned out_dir is inside its folder
                 best_tag = f"learned_alpha_mu{best_pair[0]:g}_beta{best_pair[1]:g}"
                 den_path = run_dir / best_tag / "denoised.png"
                 u_best = load_gray01(str(den_path))
